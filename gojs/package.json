@@ -1,0 +1,114 @@
+{
+  "name": "goja-debug",
+  "displayName": "Goja Debug",
+  "description": "Debug Goja JavaScript runtime in VS Code",
+  "version": "0.0.1",
+  "publisher": "goja",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "javascript"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "goja",
+        "label": "Goja Debug",
+        "languages": ["javascript"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the JavaScript file to debug"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Stop at the first line of the program",
+                "default": false
+              },
+              "args": {
+                "type": "array",
+                "description": "Command line arguments",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "debugServer": {
+                "type": "number",
+                "description": "Port of the debug server to connect to",
+                "default": 5678
+              }
+            }
+          },
+          "attach": {
+            "required": ["debugServer"],
+            "properties": {
+              "debugServer": {
+                "type": "number",
+                "description": "Port of the debug server to connect to",
+                "default": 5678
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "goja",
+            "request": "launch",
+            "name": "Debug Goja Script",
+            "program": "${workspaceFolder}/script.js",
+            "stopOnEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Goja: Launch",
+            "description": "Launch and debug a Goja script",
+            "body": {
+              "type": "goja",
+              "request": "launch",
+              "name": "Debug Goja Script",
+              "program": "^\"${workspaceFolder}/${1:script.js}\"",
+              "stopOnEntry": false
+            }
+          },
+          {
+            "label": "Goja: Attach",
+            "description": "Attach to a running Goja debug server",
+            "body": {
+              "type": "goja",
+              "request": "attach",
+              "name": "Attach to Goja",
+              "debugServer": 5678
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.74.0",
+    "typescript": "^4.9.0"
+  },
+  "dependencies": {
+    "vscode-debugadapter": "^1.51.0",
+    "vscode-debugprotocol": "^1.51.0"
+  }
+}

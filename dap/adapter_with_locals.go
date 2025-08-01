@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,92 +52,21 @@ type DebugAdapter struct {
 	waitingForCmd   bool
 	nextCommand     goja.DebugCommand
 	commandReady    chan struct{}
-
-	// Enhanced features
-	functionScopes  map[string][]string // function name -> detected variable names
-	currentFunction string              // track current function for variable detection
 }
 
 func NewDebugAdapter(reader io.Reader, writer io.Writer) *DebugAdapter {
 	return &DebugAdapter{
-		reader:         bufio.NewReader(reader),
-		writer:         writer,
-		seq:            1,
-		breakpoints:    make(map[string][]int),
-		bpMap:          make(map[int]*Breakpoint),
-		varRefMap:      make(map[int]interface{}),
-		frameMap:       make(map[int]*goja.StackFrame),
-		threadID:       1,
-		commandReady:   make(chan struct{}),
-		nextCommand:    goja.DebugContinue,
-		functionScopes: make(map[string][]string),
+		reader:       bufio.NewReader(reader),
+		writer:       writer,
+		seq:          1,
+		breakpoints:  make(map[string][]int),
+		bpMap:        make(map[int]*Breakpoint),
+		varRefMap:    make(map[int]interface{}),
+		frameMap:     make(map[int]*goja.StackFrame),
+		threadID:     1,
+		commandReady: make(chan struct{}),
+		nextCommand:  goja.DebugContinue,
 	}
-}
-
-// Parse source code to detect function parameters and local variables
-func (da *DebugAdapter) parseSourceForVariables() {
-	// Regular expressions to find functions and their variables
-	funcRegex := regexp.MustCompile(`function\s+(\w+)\s*\(([^)]*)\)`)
-	varRegex := regexp.MustCompile(`\b(var|let|const)\s+(\w+)`)
-
-	currentFunc := ""
-	inFunction := false
-	braceCount := 0
-
-	for i, line := range da.sourceLines {
-		// Check for function declaration
-		if matches := funcRegex.FindStringSubmatch(line); len(matches) > 0 {
-			currentFunc = matches[1]
-			params := matches[2]
-
-			// Parse parameters
-			if params != "" {
-				paramList := strings.Split(params, ",")
-				da.functionScopes[currentFunc] = []string{}
-				for _, param := range paramList {
-					param = strings.TrimSpace(param)
-					if param != "" {
-						da.functionScopes[currentFunc] = append(da.functionScopes[currentFunc], param)
-					}
-				}
-			} else {
-				da.functionScopes[currentFunc] = []string{}
-			}
-			inFunction = true
-			braceCount = 0
-		}
-
-		// Track braces to know when we exit a function
-		braceCount += strings.Count(line, "{") - strings.Count(line, "}")
-
-		// Look for variable declarations inside functions
-		if inFunction && currentFunc != "" {
-			if matches := varRegex.FindAllStringSubmatch(line, -1); len(matches) > 0 {
-				for _, match := range matches {
-					varName := match[2]
-					// Add to function scope if not already there
-					found := false
-					for _, v := range da.functionScopes[currentFunc] {
-						if v == varName {
-							found = true
-							break
-						}
-					}
-					if !found {
-						da.functionScopes[currentFunc] = append(da.functionScopes[currentFunc], varName)
-					}
-				}
-			}
-		}
-
-		// Check if we've exited the function
-		if inFunction && braceCount <= 0 && i > 0 {
-			inFunction = false
-			currentFunc = ""
-		}
-	}
-
-	log.Printf("Detected function scopes: %+v", da.functionScopes)
 }
 
 func (da *DebugAdapter) nextSeq() int {
@@ -345,9 +273,6 @@ func (da *DebugAdapter) handleLaunch(req *Request) {
 	da.sourceCode = string(content)
 	da.sourceLines = strings.Split(da.sourceCode, "\n")
 
-	// Parse source to detect variables
-	da.parseSourceForVariables()
-
 	log.Printf("Loaded program %s with %d lines", da.program, len(da.sourceLines))
 
 	// Create runtime and enable debugger
@@ -539,7 +464,7 @@ func (da *DebugAdapter) handleScopes(req *Request) {
 
 	// Create both Local and Global scopes
 	scopes := []Scope{}
-
+	
 	// Local scope
 	da.varRefCounter++
 	localRef := da.varRefCounter
@@ -547,20 +472,20 @@ func (da *DebugAdapter) handleScopes(req *Request) {
 		"type":    "local",
 		"frameID": args.FrameID,
 	}
-
+	
 	scopes = append(scopes, Scope{
 		Name:               "Local",
 		VariablesReference: localRef,
 		Expensive:          false,
 	})
-
+	
 	// Global scope
 	da.varRefCounter++
 	globalRef := da.varRefCounter
 	da.varRefMap[globalRef] = map[string]interface{}{
 		"type": "global",
 	}
-
+	
 	scopes = append(scopes, Scope{
 		Name:               "Global",
 		VariablesReference: globalRef,
@@ -578,7 +503,7 @@ func (da *DebugAdapter) handleVariables(req *Request) {
 		data, _ := json.Marshal(req.Arguments)
 		json.Unmarshal(data, &args)
 	}
-
+	
 	log.Printf("handleVariables: variablesReference=%d", args.VariablesReference)
 
 	var variables []Variable
@@ -588,7 +513,7 @@ func (da *DebugAdapter) handleVariables(req *Request) {
 		if info, ok := scopeInfo.(map[string]interface{}); ok {
 			scopeType := info["type"].(string)
 			log.Printf("Scope type: %s", scopeType)
-
+			
 			if scopeType == "local" {
 				frameID := info["frameID"].(int)
 				log.Printf("Getting local variables for frame %d", frameID)
@@ -614,43 +539,50 @@ func (da *DebugAdapter) handleVariables(req *Request) {
 
 func (da *DebugAdapter) getLocalVariables(frameID int) []Variable {
 	var variables []Variable
-
-	// Get frame info
-	if frame, ok := da.frameMap[frameID]; ok {
-		funcName := frame.FuncName()
-		log.Printf("Frame %d function: '%s'", frameID, funcName)
-
-		// If we're in a function, show detected variables (without evaluating)
-		if funcName != "" && funcName != "(anonymous)" {
-			// Show detected variables for this function
-			if varNames, ok := da.functionScopes[funcName]; ok {
-				// Add a note about variables
-				variables = append(variables, Variable{
-					Name:               "[Info]",
-					Value:              fmt.Sprintf("Function '%s' has %d detected variables", funcName, len(varNames)),
-					Type:               "string",
-					VariablesReference: 0,
-				})
-
-				// List detected variables (without evaluating)
-				for _, varName := range varNames {
-					variables = append(variables, Variable{
-						Name:               varName,
-						Value:              "(use Debug Console to evaluate)",
-						Type:               "unknown",
-						VariablesReference: 0,
-					})
-				}
-			}
-		}
+	
+	// Get frame from our map
+	frame, ok := da.frameMap[frameID]
+	if !ok {
+		log.Printf("Frame %d not found", frameID)
+		return variables
 	}
-
+	
+	funcName := frame.FuncName()
+	log.Printf("Getting variables for function '%s'", funcName)
+	
+	// Get local variables using the new Goja API
+	localVars := frame.GetLocalVariables()
+	log.Printf("Found %d local variables", len(localVars))
+	
+	for name, value := range localVars {
+		variable := da.valueToVariable(name, value)
+		variables = append(variables, variable)
+	}
+	
+	// Get arguments using the new Goja API
+	args := frame.GetArguments()
+	log.Printf("Found %d arguments", len(args))
+	
+	for i, arg := range args {
+		name := fmt.Sprintf("argument[%d]", i)
+		// Try to get the actual parameter name if possible
+		variable := da.valueToVariable(name, arg)
+		variables = append(variables, variable)
+	}
+	
+	// Get 'this' value
+	thisValue := frame.GetThis()
+	if thisValue != nil && !goja.IsUndefined(thisValue) {
+		variable := da.valueToVariable("this", thisValue)
+		variables = append(variables, variable)
+	}
+	
 	return variables
 }
 
 func (da *DebugAdapter) getGlobalVariables() []Variable {
 	var variables []Variable
-
+	
 	globalObj := da.vm.GlobalObject()
 	if globalObj != nil {
 		for _, key := range globalObj.Keys() {
@@ -661,86 +593,70 @@ func (da *DebugAdapter) getGlobalVariables() []Variable {
 
 			val := globalObj.Get(key)
 			if val != nil {
-				value := "undefined"
-				varType := "undefined"
-				varRef := 0
-
-				if !goja.IsUndefined(val) && !goja.IsNull(val) {
-					value = val.String()
-					varType = da.getValueType(val)
-
-					// Create reference for complex types
-					if obj, ok := val.(*goja.Object); ok {
-						if _, isFunc := goja.AssertFunction(obj); !isFunc {
-							da.varRefCounter++
-							varRef = da.varRefCounter
-							da.varRefMap[varRef] = val
-							value = da.formatComplexValue(val)
-						} else {
-							value = fmt.Sprintf("[Function: %s]", key)
-						}
-					}
-				} else if goja.IsNull(val) {
-					value = "null"
-					varType = "null"
-				}
-
-				variables = append(variables, Variable{
-					Name:               key,
-					Value:              value,
-					Type:               varType,
-					VariablesReference: varRef,
-				})
+				variable := da.valueToVariable(key, val)
+				variables = append(variables, variable)
 			}
 		}
 	}
-
+	
 	return variables
+}
+
+func (da *DebugAdapter) valueToVariable(name string, val goja.Value) Variable {
+	value := "undefined"
+	varType := "undefined"
+	varRef := 0
+	
+	if !goja.IsUndefined(val) && !goja.IsNull(val) {
+		value = val.String()
+		varType = da.getValueType(val)
+		
+		// Create reference for complex types
+		if obj, ok := val.(*goja.Object); ok {
+			if _, isFunc := goja.AssertFunction(obj); !isFunc {
+				da.varRefCounter++
+				varRef = da.varRefCounter
+				da.varRefMap[varRef] = val
+				value = da.formatComplexValue(val)
+			} else {
+				value = fmt.Sprintf("[Function: %s]", name)
+			}
+		}
+		
+		// Add quotes for strings
+		if varType == "string" {
+			value = fmt.Sprintf("%q", val.String())
+		}
+	} else if goja.IsNull(val) {
+		value = "null"
+		varType = "null"
+	}
+	
+	return Variable{
+		Name:               name,
+		Value:              value,
+		Type:               varType,
+		VariablesReference: varRef,
+	}
 }
 
 func (da *DebugAdapter) getObjectProperties(val goja.Value) []Variable {
 	var variables []Variable
-
+	
 	obj, ok := val.(*goja.Object)
 	if !ok {
 		return variables
 	}
-
+	
 	for _, key := range obj.Keys() {
 		propVal := obj.Get(key)
 		if propVal != nil {
-			value := "undefined"
-			varType := "undefined"
-			varRef := 0
-
-			if !goja.IsUndefined(propVal) && !goja.IsNull(propVal) {
-				value = propVal.String()
-				varType = da.getValueType(propVal)
-
-				// Create reference for nested objects
-				if innerObj, ok := propVal.(*goja.Object); ok {
-					if _, isFunc := goja.AssertFunction(innerObj); !isFunc {
-						da.varRefCounter++
-						varRef = da.varRefCounter
-						da.varRefMap[varRef] = propVal
-						value = da.formatComplexValue(propVal)
-					}
-				}
-			} else if goja.IsNull(propVal) {
-				value = "null"
-				varType = "null"
-			}
-
-			variables = append(variables, Variable{
-				Name:               key,
-				Value:              value,
-				Type:               varType,
-				VariablesReference: varRef,
-			})
+			variable := da.valueToVariable(key, propVal)
+			variables = append(variables, variable)
 		}
 	}
-
-	// For arrays, add length property
+	
+	// For arrays, add length property at the beginning
 	if arr := obj.Export(); arr != nil {
 		if reflect.TypeOf(arr).Kind() == reflect.Slice {
 			s := reflect.ValueOf(arr)
@@ -752,7 +668,7 @@ func (da *DebugAdapter) getObjectProperties(val goja.Value) []Variable {
 			}}, variables...)
 		}
 	}
-
+	
 	return variables
 }
 
@@ -763,7 +679,7 @@ func (da *DebugAdapter) getValueType(val goja.Value) string {
 	if goja.IsNull(val) {
 		return "null"
 	}
-
+	
 	switch val.Export().(type) {
 	case string:
 		return "string"
@@ -791,13 +707,13 @@ func (da *DebugAdapter) formatComplexValue(val goja.Value) string {
 	if !ok {
 		return val.String()
 	}
-
+	
 	// Check if it's an array
 	if arr := obj.Export(); arr != nil && reflect.TypeOf(arr).Kind() == reflect.Slice {
 		s := reflect.ValueOf(arr)
 		return fmt.Sprintf("Array[%d]", s.Len())
 	}
-
+	
 	// For objects, show a preview
 	keys := obj.Keys()
 	if len(keys) == 0 {
@@ -817,7 +733,7 @@ func (da *DebugAdapter) isBuiltIn(name string) bool {
 		"isNaN", "isFinite", "eval", "decodeURI", "decodeURIComponent",
 		"encodeURI", "encodeURIComponent", "escape", "unescape",
 	}
-
+	
 	for _, b := range builtins {
 		if name == b {
 			return true
@@ -833,15 +749,20 @@ func (da *DebugAdapter) handleEvaluate(req *Request) {
 		json.Unmarshal(data, &args)
 	}
 
-	// Temporarily disable debugger to avoid recursive calls
-	da.debugger.SetHandler(nil)
-
-	// Try to evaluate the expression
-	result, err := da.vm.RunString(args.Expression)
-
-	// Restore handler
-	da.debugger.SetHandler(da.debugHandler)
-
+	var result goja.Value
+	var err error
+	
+	// Check if we have a frame context
+	if args.FrameID > 0 {
+		// Use the new EvaluateInFrame API
+		log.Printf("Evaluating '%s' in frame %d", args.Expression, args.FrameID)
+		result, err = da.vm.EvaluateInFrame(args.Expression, args.FrameID-1) // Convert to 0-based
+	} else {
+		// Evaluate in global context
+		log.Printf("Evaluating '%s' in global context", args.Expression)
+		result, err = da.vm.RunString(args.Expression)
+	}
+	
 	if err != nil {
 		da.sendResponse(req.Seq, req.Command, false, map[string]string{
 			"error": err.Error(),
@@ -851,10 +772,12 @@ func (da *DebugAdapter) handleEvaluate(req *Request) {
 
 	value := "(undefined)"
 	varRef := 0
-
+	varType := "undefined"
+	
 	if result != nil && !goja.IsUndefined(result) {
 		value = result.String()
-
+		varType = da.getValueType(result)
+		
 		// Create reference for complex types
 		if obj, ok := result.(*goja.Object); ok {
 			if _, isFunc := goja.AssertFunction(obj); !isFunc {
@@ -864,22 +787,27 @@ func (da *DebugAdapter) handleEvaluate(req *Request) {
 				value = da.formatComplexValue(result)
 			}
 		}
+		
+		// Add quotes for strings in the result
+		if varType == "string" {
+			value = fmt.Sprintf("%q", result.String())
+		}
 	}
 
 	da.sendResponse(req.Seq, req.Command, true, EvaluateResponseBody{
 		Result:             value,
-		Type:               da.getValueType(result),
+		Type:               varType,
 		VariablesReference: varRef,
 	})
 }
 
 func (da *DebugAdapter) handleContinue(req *Request) {
 	log.Printf("=== CONTINUE: Setting next command to Continue")
-
+	
 	da.debugStateMutex.Lock()
 	da.nextCommand = goja.DebugContinue
 	da.debugger.SetStepMode(false)
-
+	
 	if da.waitingForCmd {
 		da.waitingForCmd = false
 		close(da.commandReady)
@@ -894,11 +822,11 @@ func (da *DebugAdapter) handleContinue(req *Request) {
 
 func (da *DebugAdapter) handleNext(req *Request) {
 	log.Printf("=== NEXT: Setting next command to StepOver")
-
+	
 	da.debugStateMutex.Lock()
 	da.nextCommand = goja.DebugStepOver
 	da.debugger.SetStepMode(true)
-
+	
 	if da.waitingForCmd {
 		da.waitingForCmd = false
 		close(da.commandReady)
@@ -913,7 +841,7 @@ func (da *DebugAdapter) handleStepIn(req *Request) {
 	da.debugStateMutex.Lock()
 	da.nextCommand = goja.DebugStepInto
 	da.debugger.SetStepMode(true)
-
+	
 	if da.waitingForCmd {
 		da.waitingForCmd = false
 		close(da.commandReady)
@@ -928,7 +856,7 @@ func (da *DebugAdapter) handleStepOut(req *Request) {
 	da.debugStateMutex.Lock()
 	da.nextCommand = goja.DebugStepOut
 	da.debugger.SetStepMode(true)
-
+	
 	if da.waitingForCmd {
 		da.waitingForCmd = false
 		close(da.commandReady)
@@ -959,32 +887,11 @@ func (da *DebugAdapter) debugHandler(state *goja.DebuggerState) goja.DebugComman
 	log.Printf("\n=== DEBUG HANDLER ===")
 	log.Printf("Position: %s:%d:%d", state.SourcePos.Filename, state.SourcePos.Line, state.SourcePos.Column)
 	log.Printf("Has Breakpoint: %v", state.Breakpoint != nil)
-
-	// Update current function context
-	if len(da.frameMap) > 0 {
-		if frame, ok := da.frameMap[1]; ok {
-			da.currentFunction = frame.FuncName()
-		}
-	}
-
+	
 	// Get current line content for context
 	if state.SourcePos.Line > 0 && state.SourcePos.Line <= len(da.sourceLines) {
 		line := da.sourceLines[state.SourcePos.Line-1]
 		log.Printf("Current line: %s", strings.TrimSpace(line))
-
-		// Special handling for console.log - skip internal positions
-		if strings.Contains(line, "console.log") && state.SourcePos.Column > 1 {
-			// Check if we should skip this position
-			da.debugStateMutex.Lock()
-			currentCmd := da.nextCommand
-			da.debugStateMutex.Unlock()
-
-			// In step mode, only stop at the beginning of the line
-			if currentCmd != goja.DebugContinue && !strings.HasPrefix(strings.TrimSpace(line), "console.log") {
-				log.Printf("Skipping console.log internal position")
-				return currentCmd
-			}
-		}
 	}
 
 	// Check if we're at the end of the script
@@ -999,12 +906,12 @@ func (da *DebugAdapter) debugHandler(state *goja.DebuggerState) goja.DebugComman
 		reason = "breakpoint"
 		log.Printf("Hit breakpoint at line %d", state.SourcePos.Line)
 	}
-
+	
 	// Get the current command mode
 	da.debugStateMutex.Lock()
 	currentCmd := da.nextCommand
 	da.debugStateMutex.Unlock()
-
+	
 	// If we're in continue mode and there's no breakpoint, just continue
 	if currentCmd == goja.DebugContinue && state.Breakpoint == nil {
 		log.Printf("In continue mode with no breakpoint - continuing")
@@ -1039,9 +946,9 @@ func (da *DebugAdapter) startExecution() {
 
 	log.Printf("Starting script execution...")
 	_, err := da.vm.RunScript(da.program, da.sourceCode)
-
+	
 	da.running = false
-
+	
 	if err != nil {
 		log.Printf("Script error: %v", err)
 		da.sendEvent("output", map[string]interface{}{
@@ -1049,13 +956,13 @@ func (da *DebugAdapter) startExecution() {
 			"output":   fmt.Sprintf("Error: %v\n", err),
 		})
 	}
-
+	
 	// Send exit event
 	exitCode := 0
 	if err != nil {
 		exitCode = 1
 	}
-
+	
 	da.sendEvent("exited", ExitedEventBody{
 		ExitCode: exitCode,
 	})

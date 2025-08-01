@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,26 +48,97 @@ type DebugAdapter struct {
 	currentFrameID int
 	frameMap       map[int]*goja.StackFrame
 
-	// Pause state
-	pauseChan chan struct{}
-	stepMode  goja.DebugCommand
-
 	// Synchronization
-	initMutex sync.Mutex
+	debugStateMutex sync.Mutex
+	waitingForCmd   bool
+	nextCommand     goja.DebugCommand
+	commandReady    chan struct{}
+	
+	// Enhanced features
+	functionScopes  map[string][]string  // function name -> detected variable names
+	currentFunction string               // track current function for variable detection
 }
 
 func NewDebugAdapter(reader io.Reader, writer io.Writer) *DebugAdapter {
 	return &DebugAdapter{
-		reader:      bufio.NewReader(reader),
-		writer:      writer,
-		seq:         1,
-		breakpoints: make(map[string][]int),
-		bpMap:       make(map[int]*Breakpoint),
-		varRefMap:   make(map[int]interface{}),
-		frameMap:    make(map[int]*goja.StackFrame),
-		threadID:    1,
-		pauseChan:   make(chan struct{}, 1),
+		reader:         bufio.NewReader(reader),
+		writer:         writer,
+		seq:            1,
+		breakpoints:    make(map[string][]int),
+		bpMap:          make(map[int]*Breakpoint),
+		varRefMap:      make(map[int]interface{}),
+		frameMap:       make(map[int]*goja.StackFrame),
+		threadID:       1,
+		commandReady:   make(chan struct{}),
+		nextCommand:    goja.DebugContinue,
+		functionScopes: make(map[string][]string),
 	}
+}
+
+// Parse source code to detect function parameters and local variables
+func (da *DebugAdapter) parseSourceForVariables() {
+	// Regular expressions to find functions and their variables
+	funcRegex := regexp.MustCompile(`function\s+(\w+)\s*\(([^)]*)\)`)
+	varRegex := regexp.MustCompile(`\b(var|let|const)\s+(\w+)`)
+	
+	currentFunc := ""
+	inFunction := false
+	braceCount := 0
+	
+	for i, line := range da.sourceLines {
+		// Check for function declaration
+		if matches := funcRegex.FindStringSubmatch(line); len(matches) > 0 {
+			currentFunc = matches[1]
+			params := matches[2]
+			
+			// Parse parameters
+			if params != "" {
+				paramList := strings.Split(params, ",")
+				da.functionScopes[currentFunc] = []string{}
+				for _, param := range paramList {
+					param = strings.TrimSpace(param)
+					if param != "" {
+						da.functionScopes[currentFunc] = append(da.functionScopes[currentFunc], param)
+					}
+				}
+			} else {
+				da.functionScopes[currentFunc] = []string{}
+			}
+			inFunction = true
+			braceCount = 0
+		}
+		
+		// Track braces to know when we exit a function
+		braceCount += strings.Count(line, "{") - strings.Count(line, "}")
+		
+		// Look for variable declarations inside functions
+		if inFunction && currentFunc != "" {
+			if matches := varRegex.FindAllStringSubmatch(line, -1); len(matches) > 0 {
+				for _, match := range matches {
+					varName := match[2]
+					// Add to function scope if not already there
+					found := false
+					for _, v := range da.functionScopes[currentFunc] {
+						if v == varName {
+							found = true
+							break
+						}
+					}
+					if !found {
+						da.functionScopes[currentFunc] = append(da.functionScopes[currentFunc], varName)
+					}
+				}
+			}
+		}
+		
+		// Check if we've exited the function
+		if inFunction && braceCount <= 0 && i > 0 {
+			inFunction = false
+			currentFunc = ""
+		}
+	}
+	
+	log.Printf("Detected function scopes: %+v", da.functionScopes)
 }
 
 func (da *DebugAdapter) nextSeq() int {
@@ -272,6 +344,9 @@ func (da *DebugAdapter) handleLaunch(req *Request) {
 
 	da.sourceCode = string(content)
 	da.sourceLines = strings.Split(da.sourceCode, "\n")
+	
+	// Parse source to detect variables
+	da.parseSourceForVariables()
 
 	log.Printf("Loaded program %s with %d lines", da.program, len(da.sourceLines))
 
@@ -281,19 +356,27 @@ func (da *DebugAdapter) handleLaunch(req *Request) {
 
 	// Set up console.log
 	console := da.vm.NewObject()
-	console.Set("log", func(args ...interface{}) {
+	console.Set("log", func(call goja.FunctionCall) goja.Value {
 		// Format the output properly with spaces between arguments
 		var output string
-		for i, arg := range args {
+		for i, arg := range call.Arguments {
 			if i > 0 {
 				output += " "
 			}
-			output += fmt.Sprint(arg)
+			// Convert goja.Value to string
+			if arg != nil && !goja.IsUndefined(arg) && !goja.IsNull(arg) {
+				output += arg.String()
+			} else if goja.IsNull(arg) {
+				output += "null"
+			} else {
+				output += "undefined"
+			}
 		}
 		da.sendEvent("output", map[string]interface{}{
 			"category": "console",
 			"output":   output + "\n",
 		})
+		return goja.Undefined()
 	})
 	da.vm.Set("console", console)
 
@@ -302,12 +385,11 @@ func (da *DebugAdapter) handleLaunch(req *Request) {
 
 	// Only enable step mode if explicitly requested
 	if args.StopOnEntry {
+		da.nextCommand = goja.DebugStepInto
 		da.debugger.SetStepMode(true)
-		da.stepMode = goja.DebugStepInto
 	} else {
-		// Make sure we start in continue mode
+		da.nextCommand = goja.DebugContinue
 		da.debugger.SetStepMode(false)
-		da.stepMode = goja.DebugContinue
 	}
 
 	da.sendResponse(req.Seq, req.Command, true, nil)
@@ -327,7 +409,6 @@ func (da *DebugAdapter) handleSetBreakpoints(req *Request) {
 	}
 
 	// Make sure we're using the same filename as the program
-	// VS Code might send absolute path, but we loaded with relative path
 	if filepath.Base(filename) == filepath.Base(da.program) {
 		filename = da.program
 		log.Printf("Normalized filename from %s to %s", args.Source.Path, filename)
@@ -337,17 +418,12 @@ func (da *DebugAdapter) handleSetBreakpoints(req *Request) {
 
 	// Remove ALL old breakpoints for this file
 	if da.debugger != nil {
-		// Get all existing breakpoints
 		existingBPs := da.debugger.GetBreakpoints()
-		log.Printf("Found %d existing breakpoints", len(existingBPs))
 		for _, ebp := range existingBPs {
 			if ebp.SourcePos.Filename == filename {
-				log.Printf("Removing breakpoint ID=%d at line %d", ebp.ID(), ebp.SourcePos.Line)
 				da.debugger.RemoveBreakpoint(ebp.ID())
 			}
 		}
-	} else {
-		log.Printf("Warning: debugger not initialized yet, deferring breakpoint setup")
 	}
 
 	// Clear our tracking maps
@@ -363,7 +439,6 @@ func (da *DebugAdapter) handleSetBreakpoints(req *Request) {
 
 	for _, sbp := range args.Breakpoints {
 		// Add breakpoint to debugger
-		// Note: Goja uses 1-based line numbers, same as VS Code
 		gojaID := da.debugger.AddBreakpoint(filename, sbp.Line, sbp.Column)
 
 		da.bpIDCounter++
@@ -381,8 +456,8 @@ func (da *DebugAdapter) handleSetBreakpoints(req *Request) {
 		da.breakpoints[filename] = append(da.breakpoints[filename], sbp.Line)
 		breakpoints = append(breakpoints, bp)
 
-		log.Printf("Added breakpoint: file=%s, line=%d, column=%d, gojaID=%d, dapID=%d",
-			filename, sbp.Line, sbp.Column, gojaID, bpID)
+		log.Printf("Added breakpoint: file=%s, line=%d, column=%d, gojaID=%d",
+			filename, sbp.Line, sbp.Column, gojaID)
 	}
 
 	da.sendResponse(req.Seq, req.Command, true, SetBreakpointsResponseBody{
@@ -391,16 +466,11 @@ func (da *DebugAdapter) handleSetBreakpoints(req *Request) {
 }
 
 func (da *DebugAdapter) handleConfigurationDone(req *Request) {
-	log.Printf(">>> ConfigurationDone - all breakpoints set, starting execution")
+	log.Printf(">>> ConfigurationDone - starting execution")
 
 	da.sendResponse(req.Seq, req.Command, true, nil)
 
-	// Set initial step mode to continue (not step)
-	da.stepMode = goja.DebugContinue
-	log.Printf(">>> Initial step mode: Continue")
-
 	// Start execution in a goroutine
-	log.Printf(">>> Launching script execution in goroutine")
 	go da.startExecution()
 }
 
@@ -444,7 +514,7 @@ func (da *DebugAdapter) handleStackTrace(req *Request) {
 			ID:     frameID,
 			Name:   funcName,
 			Line:   pos.Line,
-			Column: 1, // VS Code espera 1-based, usar 1 para inicio de línea
+			Column: 1,
 			Source: Source{
 				Name: filepath.Base(pos.Filename),
 				Path: pos.Filename,
@@ -467,19 +537,35 @@ func (da *DebugAdapter) handleScopes(req *Request) {
 		json.Unmarshal(data, &args)
 	}
 
+	// Create both Local and Global scopes
+	scopes := []Scope{}
+	
+	// Local scope
 	da.varRefCounter++
 	localRef := da.varRefCounter
-
-	// Store frame ID for variable lookup
-	da.varRefMap[localRef] = args.FrameID
-
-	scopes := []Scope{
-		{
-			Name:               "Local",
-			VariablesReference: localRef,
-			Expensive:          false,
-		},
+	da.varRefMap[localRef] = map[string]interface{}{
+		"type":    "local",
+		"frameID": args.FrameID,
 	}
+	
+	scopes = append(scopes, Scope{
+		Name:               "Local",
+		VariablesReference: localRef,
+		Expensive:          false,
+	})
+	
+	// Global scope
+	da.varRefCounter++
+	globalRef := da.varRefCounter
+	da.varRefMap[globalRef] = map[string]interface{}{
+		"type": "global",
+	}
+	
+	scopes = append(scopes, Scope{
+		Name:               "Global",
+		VariablesReference: globalRef,
+		Expensive:          false,
+	})
 
 	da.sendResponse(req.Seq, req.Command, true, ScopesResponseBody{
 		Scopes: scopes,
@@ -492,107 +578,252 @@ func (da *DebugAdapter) handleVariables(req *Request) {
 		data, _ := json.Marshal(req.Arguments)
 		json.Unmarshal(data, &args)
 	}
+	
+	log.Printf("handleVariables: variablesReference=%d", args.VariablesReference)
 
 	var variables []Variable
 
-	// Get the frame ID from the variable reference
-	if frameID, ok := da.varRefMap[args.VariablesReference]; ok {
-		if fid, ok := frameID.(int); ok {
-			// Get variables for this frame
-			// This is a simplified version - in production you'd get actual scope variables
-			variables = da.getFrameVariables(fid)
+	// Get scope info
+	if scopeInfo, ok := da.varRefMap[args.VariablesReference]; ok {
+		if info, ok := scopeInfo.(map[string]interface{}); ok {
+			scopeType := info["type"].(string)
+			log.Printf("Scope type: %s", scopeType)
+			
+			if scopeType == "local" {
+				frameID := info["frameID"].(int)
+				log.Printf("Getting local variables for frame %d", frameID)
+				variables = da.getLocalVariables(frameID)
+			} else if scopeType == "global" {
+				log.Printf("Getting global variables")
+				variables = da.getGlobalVariables()
+			}
+		} else if val, ok := scopeInfo.(goja.Value); ok {
+			// It's an object to expand
+			log.Printf("Expanding object properties")
+			variables = da.getObjectProperties(val)
 		}
+	} else {
+		log.Printf("WARNING: variablesReference %d not found in map", args.VariablesReference)
 	}
 
+	log.Printf("Returning %d variables", len(variables))
 	da.sendResponse(req.Seq, req.Command, true, VariablesResponseBody{
 		Variables: variables,
 	})
 }
 
-func (da *DebugAdapter) getFrameVariables(frameID int) []Variable {
+func (da *DebugAdapter) getLocalVariables(frameID int) []Variable {
 	var variables []Variable
-
-	// Get the current global object to access variables
-	if da.vm == nil {
-		log.Printf("Warning: VM is nil when getting variables")
-		return variables
+	
+	// Get frame info
+	if frame, ok := da.frameMap[frameID]; ok {
+		funcName := frame.FuncName()
+		log.Printf("Frame %d function: '%s'", frameID, funcName)
+		
+		// If we're in a function, show detected variables (without evaluating)
+		if funcName != "" && funcName != "(anonymous)" {
+			// Show detected variables for this function
+			if varNames, ok := da.functionScopes[funcName]; ok {
+				// Add a note about variables
+				variables = append(variables, Variable{
+					Name:  "[Info]",
+					Value: fmt.Sprintf("Function '%s' has %d detected variables", funcName, len(varNames)),
+					Type:  "string",
+					VariablesReference: 0,
+				})
+				
+				// List detected variables (without evaluating)
+				for _, varName := range varNames {
+					variables = append(variables, Variable{
+						Name:               varName,
+						Value:              "(use Debug Console to evaluate)",
+						Type:               "unknown",
+						VariablesReference: 0,
+					})
+				}
+			}
+		}
 	}
+	
+	return variables
+}
 
-	// Get global variables
+func (da *DebugAdapter) getGlobalVariables() []Variable {
+	var variables []Variable
+	
 	globalObj := da.vm.GlobalObject()
-	if globalObj == nil {
-		log.Printf("Warning: Global object is nil")
-		return variables
-	}
-
-	// Get all property names from the global object
-	for _, key := range globalObj.Keys() {
-		val := globalObj.Get(key)
-		if val != nil {
-			// Skip built-in objects and functions for now
-			if key == "console" || key == "Object" || key == "Function" || key == "Array" {
+	if globalObj != nil {
+		for _, key := range globalObj.Keys() {
+			// Skip built-ins
+			if da.isBuiltIn(key) {
 				continue
 			}
 
+			val := globalObj.Get(key)
+			if val != nil {
+				value := "undefined"
+				varType := "undefined"
+				varRef := 0
+				
+				if !goja.IsUndefined(val) && !goja.IsNull(val) {
+					value = val.String()
+					varType = da.getValueType(val)
+					
+					// Create reference for complex types
+					if obj, ok := val.(*goja.Object); ok {
+						if _, isFunc := goja.AssertFunction(obj); !isFunc {
+							da.varRefCounter++
+							varRef = da.varRefCounter
+							da.varRefMap[varRef] = val
+							value = da.formatComplexValue(val)
+						} else {
+							value = fmt.Sprintf("[Function: %s]", key)
+						}
+					}
+				} else if goja.IsNull(val) {
+					value = "null"
+					varType = "null"
+				}
+
+				variables = append(variables, Variable{
+					Name:               key,
+					Value:              value,
+					Type:               varType,
+					VariablesReference: varRef,
+				})
+			}
+		}
+	}
+	
+	return variables
+}
+
+func (da *DebugAdapter) getObjectProperties(val goja.Value) []Variable {
+	var variables []Variable
+	
+	obj, ok := val.(*goja.Object)
+	if !ok {
+		return variables
+	}
+	
+	for _, key := range obj.Keys() {
+		propVal := obj.Get(key)
+		if propVal != nil {
+			value := "undefined"
 			varType := "undefined"
-			varValue := "undefined"
 			varRef := 0
-
-			// Get the actual value and type
-			if !goja.IsUndefined(val) && !goja.IsNull(val) {
-				varValue = val.String()
-
-				// Determine type
-				switch val.ExportType().Kind() {
-				case reflect.String:
-					varType = "string"
-				case reflect.Int, reflect.Int32, reflect.Int64, reflect.Float32, reflect.Float64:
-					varType = "number"
-				case reflect.Bool:
-					varType = "boolean"
-				case reflect.Map, reflect.Struct:
-					varType = "object"
-					// Create a variable reference for objects
-					da.varRefCounter++
-					varRef = da.varRefCounter
-					da.varRefMap[varRef] = val
-				case reflect.Slice, reflect.Array:
-					varType = "array"
-					// Create a variable reference for arrays
-					da.varRefCounter++
-					varRef = da.varRefCounter
-					da.varRefMap[varRef] = val
-				default:
-					if _, ok := val.(*goja.Object); ok {
-						varType = "object"
+			
+			if !goja.IsUndefined(propVal) && !goja.IsNull(propVal) {
+				value = propVal.String()
+				varType = da.getValueType(propVal)
+				
+				// Create reference for nested objects
+				if innerObj, ok := propVal.(*goja.Object); ok {
+					if _, isFunc := goja.AssertFunction(innerObj); !isFunc {
 						da.varRefCounter++
 						varRef = da.varRefCounter
-						da.varRefMap[varRef] = val
+						da.varRefMap[varRef] = propVal
+						value = da.formatComplexValue(propVal)
 					}
 				}
+			} else if goja.IsNull(propVal) {
+				value = "null"
+				varType = "null"
 			}
-
+			
 			variables = append(variables, Variable{
 				Name:               key,
-				Value:              varValue,
+				Value:              value,
 				Type:               varType,
 				VariablesReference: varRef,
 			})
 		}
 	}
-
-	log.Printf("Found %d variables in frame %d", len(variables), frameID)
+	
+	// For arrays, add length property
+	if arr := obj.Export(); arr != nil {
+		if reflect.TypeOf(arr).Kind() == reflect.Slice {
+			s := reflect.ValueOf(arr)
+			variables = append([]Variable{{
+				Name:               "length",
+				Value:              strconv.Itoa(s.Len()),
+				Type:               "number",
+				VariablesReference: 0,
+			}}, variables...)
+		}
+	}
+	
 	return variables
 }
 
-func (da *DebugAdapter) formatValue(val goja.Value) string {
-	if val == nil || goja.IsUndefined(val) {
+func (da *DebugAdapter) getValueType(val goja.Value) string {
+	if goja.IsUndefined(val) {
 		return "undefined"
 	}
 	if goja.IsNull(val) {
 		return "null"
 	}
-	return val.String()
+	
+	switch val.Export().(type) {
+	case string:
+		return "string"
+	case int, int64, float64:
+		return "number"
+	case bool:
+		return "boolean"
+	default:
+		if obj, ok := val.(*goja.Object); ok {
+			if _, ok := goja.AssertFunction(obj); ok {
+				return "function"
+			}
+			// Check if it's an array
+			if arr := obj.Export(); arr != nil && reflect.TypeOf(arr).Kind() == reflect.Slice {
+				return "array"
+			}
+			return "object"
+		}
+		return "unknown"
+	}
+}
+
+func (da *DebugAdapter) formatComplexValue(val goja.Value) string {
+	obj, ok := val.(*goja.Object)
+	if !ok {
+		return val.String()
+	}
+	
+	// Check if it's an array
+	if arr := obj.Export(); arr != nil && reflect.TypeOf(arr).Kind() == reflect.Slice {
+		s := reflect.ValueOf(arr)
+		return fmt.Sprintf("Array[%d]", s.Len())
+	}
+	
+	// For objects, show a preview
+	keys := obj.Keys()
+	if len(keys) == 0 {
+		return "{}"
+	} else if len(keys) <= 3 {
+		return fmt.Sprintf("{%s}", strings.Join(keys, ", "))
+	} else {
+		return fmt.Sprintf("{%s, ...}", strings.Join(keys[:3], ", "))
+	}
+}
+
+func (da *DebugAdapter) isBuiltIn(name string) bool {
+	builtins := []string{
+		"console", "Object", "Function", "Array", "String", "Number",
+		"Boolean", "Date", "JSON", "Math", "RegExp", "Error",
+		"undefined", "Infinity", "NaN", "parseInt", "parseFloat",
+		"isNaN", "isFinite", "eval", "decodeURI", "decodeURIComponent",
+		"encodeURI", "encodeURIComponent", "escape", "unescape",
+	}
+	
+	for _, b := range builtins {
+		if name == b {
+			return true
+		}
+	}
+	return false
 }
 
 func (da *DebugAdapter) handleEvaluate(req *Request) {
@@ -602,8 +833,15 @@ func (da *DebugAdapter) handleEvaluate(req *Request) {
 		json.Unmarshal(data, &args)
 	}
 
+	// Temporarily disable debugger to avoid recursive calls
+	da.debugger.SetHandler(nil)
+	
 	// Try to evaluate the expression
 	result, err := da.vm.RunString(args.Expression)
+	
+	// Restore handler
+	da.debugger.SetHandler(da.debugHandler)
+	
 	if err != nil {
 		da.sendResponse(req.Seq, req.Command, false, map[string]string{
 			"error": err.Error(),
@@ -612,28 +850,42 @@ func (da *DebugAdapter) handleEvaluate(req *Request) {
 	}
 
 	value := "(undefined)"
-	if result != nil {
+	varRef := 0
+	
+	if result != nil && !goja.IsUndefined(result) {
 		value = result.String()
+		
+		// Create reference for complex types
+		if obj, ok := result.(*goja.Object); ok {
+			if _, isFunc := goja.AssertFunction(obj); !isFunc {
+				da.varRefCounter++
+				varRef = da.varRefCounter
+				da.varRefMap[varRef] = result
+				value = da.formatComplexValue(result)
+			}
+		}
 	}
 
 	da.sendResponse(req.Seq, req.Command, true, EvaluateResponseBody{
 		Result:             value,
-		VariablesReference: 0,
+		Type:               da.getValueType(result),
+		VariablesReference: varRef,
 	})
 }
 
 func (da *DebugAdapter) handleContinue(req *Request) {
-	log.Printf("Continue request received")
-	da.stepMode = goja.DebugContinue
+	log.Printf("=== CONTINUE: Setting next command to Continue")
+	
+	da.debugStateMutex.Lock()
+	da.nextCommand = goja.DebugContinue
 	da.debugger.SetStepMode(false)
-
-	// Signal to continue
-	select {
-	case da.pauseChan <- struct{}{}:
-		log.Printf("Sent continue signal")
-	default:
-		log.Printf("Warning: pause channel was full")
+	
+	if da.waitingForCmd {
+		da.waitingForCmd = false
+		close(da.commandReady)
+		da.commandReady = make(chan struct{})
 	}
+	da.debugStateMutex.Unlock()
 
 	da.sendResponse(req.Seq, req.Command, true, ContinueResponseBody{
 		AllThreadsContinued: true,
@@ -641,43 +893,48 @@ func (da *DebugAdapter) handleContinue(req *Request) {
 }
 
 func (da *DebugAdapter) handleNext(req *Request) {
-	log.Printf("Next (step over) request received")
-	da.stepMode = goja.DebugStepOver
+	log.Printf("=== NEXT: Setting next command to StepOver")
+	
+	da.debugStateMutex.Lock()
+	da.nextCommand = goja.DebugStepOver
 	da.debugger.SetStepMode(true)
-
-	// Signal to continue
-	select {
-	case da.pauseChan <- struct{}{}:
-		log.Printf("Sent step over signal")
-	default:
-		log.Printf("Warning: pause channel was full")
+	
+	if da.waitingForCmd {
+		da.waitingForCmd = false
+		close(da.commandReady)
+		da.commandReady = make(chan struct{})
 	}
+	da.debugStateMutex.Unlock()
 
 	da.sendResponse(req.Seq, req.Command, true, nil)
 }
 
 func (da *DebugAdapter) handleStepIn(req *Request) {
-	da.stepMode = goja.DebugStepInto
+	da.debugStateMutex.Lock()
+	da.nextCommand = goja.DebugStepInto
 	da.debugger.SetStepMode(true)
-
-	// Signal to continue
-	select {
-	case da.pauseChan <- struct{}{}:
-	default:
+	
+	if da.waitingForCmd {
+		da.waitingForCmd = false
+		close(da.commandReady)
+		da.commandReady = make(chan struct{})
 	}
+	da.debugStateMutex.Unlock()
 
 	da.sendResponse(req.Seq, req.Command, true, nil)
 }
 
 func (da *DebugAdapter) handleStepOut(req *Request) {
-	da.stepMode = goja.DebugStepOut
+	da.debugStateMutex.Lock()
+	da.nextCommand = goja.DebugStepOut
 	da.debugger.SetStepMode(true)
-
-	// Signal to continue
-	select {
-	case da.pauseChan <- struct{}{}:
-	default:
+	
+	if da.waitingForCmd {
+		da.waitingForCmd = false
+		close(da.commandReady)
+		da.commandReady = make(chan struct{})
 	}
+	da.debugStateMutex.Unlock()
 
 	da.sendResponse(req.Seq, req.Command, true, nil)
 }
@@ -698,130 +955,99 @@ func (da *DebugAdapter) handleTerminate(req *Request) {
 	da.terminated = true
 }
 
-// Track last line to avoid multiple stops on same line
-var lastStoppedLine int
-
 func (da *DebugAdapter) debugHandler(state *goja.DebuggerState) goja.DebugCommand {
-	// Track last position to avoid duplicate stops
-	currentPos := fmt.Sprintf("%s:%d:%d", state.SourcePos.Filename, state.SourcePos.Line, state.SourcePos.Column)
-
-	log.Printf("\n=== DEBUG HANDLER CALLED ===")
-	log.Printf("Position: %s", currentPos)
+	log.Printf("\n=== DEBUG HANDLER ===")
+	log.Printf("Position: %s:%d:%d", state.SourcePos.Filename, state.SourcePos.Line, state.SourcePos.Column)
 	log.Printf("Has Breakpoint: %v", state.Breakpoint != nil)
-	log.Printf("Current step mode: %v", da.stepMode)
-	log.Printf("Last stopped line: %d", lastStoppedLine)
-
-	// Check if we're at the end of the script (position :0:0)
-	if state.SourcePos.Filename == "" && state.SourcePos.Line == 0 {
-		log.Printf(">>> END OF SCRIPT: Reached position :0:0, continuing to finish")
-		return goja.DebugContinue
+	
+	// Update current function context
+	if len(da.frameMap) > 0 {
+		if frame, ok := da.frameMap[1]; ok {
+			da.currentFunction = frame.FuncName()
+		}
 	}
 	
-	// REMOVED: Skip same line logic - let it stop at each column
-	// This is more predictable and avoids issues with loops
-
-	// Send stopped event
-	reason := "step"
-	description := ""
-
-	// Check if we should have hit a breakpoint
-	if state.Breakpoint == nil {
-		if bps, ok := da.breakpoints[state.SourcePos.Filename]; ok {
-			for _, bpLine := range bps {
-				if bpLine == state.SourcePos.Line {
-					log.Printf("WARNING: At breakpoint line %d but state.Breakpoint is nil! This might be a Goja issue.", bpLine)
-					// Force it to act like a breakpoint
-					reason = "breakpoint"
-					description = fmt.Sprintf("Breakpoint at line %d", state.SourcePos.Line)
-				}
+	// Get current line content for context
+	if state.SourcePos.Line > 0 && state.SourcePos.Line <= len(da.sourceLines) {
+		line := da.sourceLines[state.SourcePos.Line-1]
+		log.Printf("Current line: %s", strings.TrimSpace(line))
+		
+		// Special handling for console.log - skip internal positions
+		if strings.Contains(line, "console.log") && state.SourcePos.Column > 1 {
+			// Check if we should skip this position
+			da.debugStateMutex.Lock()
+			currentCmd := da.nextCommand
+			da.debugStateMutex.Unlock()
+			
+			// In step mode, only stop at the beginning of the line
+			if currentCmd != goja.DebugContinue && !strings.HasPrefix(strings.TrimSpace(line), "console.log") {
+				log.Printf("Skipping console.log internal position")
+				return currentCmd
 			}
 		}
 	}
 
+	// Check if we're at the end of the script
+	if state.SourcePos.Filename == "" && state.SourcePos.Line == 0 {
+		log.Printf("End of script - continuing")
+		return goja.DebugContinue
+	}
+
+	// Determine stop reason
+	reason := "step"
 	if state.Breakpoint != nil {
 		reason = "breakpoint"
-		description = fmt.Sprintf("Breakpoint at line %d", state.SourcePos.Line)
-		log.Printf("Hit breakpoint ID=%d at %s:%d:%d (BP was set for line %d)",
-			state.Breakpoint.ID(), state.SourcePos.Filename, state.SourcePos.Line, state.SourcePos.Column,
-			state.Breakpoint.SourcePos.Line)
-
-		// Check if we're at the wrong line
-		if state.SourcePos.Line != state.Breakpoint.SourcePos.Line {
-			log.Printf("WARNING: Breakpoint line mismatch! Stopped at line %d but breakpoint is for line %d",
-				state.SourcePos.Line, state.Breakpoint.SourcePos.Line)
-		}
-	} else {
-		// Get the source line for context
-		lineText := ""
-		if state.SourcePos.Line > 0 && state.SourcePos.Line <= len(da.sourceLines) {
-			lineText = strings.TrimSpace(da.sourceLines[state.SourcePos.Line-1])
-			if len(lineText) > 50 {
-				lineText = lineText[:47] + "..."
-			}
-		}
-		log.Printf("Stepped to %s:%d:%d (PC=%d) | %s",
-			state.SourcePos.Filename, state.SourcePos.Line, state.SourcePos.Column, state.PC, lineText)
-
-		// If we're in step over mode and this looks like we're entering a branch we shouldn't
-		// (e.g., else branch when if was true), we might want to continue
-		// This is a heuristic - proper fix would be in the Goja VM itself
-		if da.stepMode == goja.DebugStepOver {
-			// Check if this is likely a branch we shouldn't enter
-			// For now, we'll trust Goja's stepping logic
-		}
+		log.Printf("Hit breakpoint at line %d", state.SourcePos.Line)
+	}
+	
+	// Get the current command mode
+	da.debugStateMutex.Lock()
+	currentCmd := da.nextCommand
+	da.debugStateMutex.Unlock()
+	
+	// If we're in continue mode and there's no breakpoint, just continue
+	if currentCmd == goja.DebugContinue && state.Breakpoint == nil {
+		log.Printf("In continue mode with no breakpoint - continuing")
+		return goja.DebugContinue
 	}
 
+	// Send stopped event
 	da.sendEvent("stopped", StoppedEventBody{
 		Reason:            reason,
-		Description:       description,
 		ThreadID:          da.threadID,
 		AllThreadsStopped: true,
 	})
 
-	// Update last stopped line
-	lastStoppedLine = state.SourcePos.Line
+	// Wait for command
+	da.debugStateMutex.Lock()
+	da.waitingForCmd = true
+	da.debugStateMutex.Unlock()
 
-	// Wait for continue signal
-	log.Printf(">>> PAUSED: Waiting for continue signal at %s", currentPos)
-	log.Printf(">>> To resume, VS Code needs to send: continue, next, stepIn, or stepOut")
+	log.Printf("Waiting for debugger command...")
+	<-da.commandReady
 
-	// This blocks until we receive a signal
-	<-da.pauseChan
+	da.debugStateMutex.Lock()
+	cmd := da.nextCommand
+	da.debugStateMutex.Unlock()
 
-	log.Printf(">>> RESUMING: Received signal, step mode = %v", da.stepMode)
-
-	// Reset last line if we're continuing (not stepping)
-	if da.stepMode == goja.DebugContinue {
-		lastStoppedLine = -1
-		log.Printf(">>> Reset last stopped line for continue mode")
-	}
-
-	log.Printf(">>> Returning command: %v", da.stepMode)
-	return da.stepMode
+	log.Printf("Returning command: %v", cmd)
+	return cmd
 }
 
 func (da *DebugAdapter) startExecution() {
 	da.running = true
 
-	log.Printf("Starting execution of script: %s", da.program)
-
-	// Don't prime the channel - let the debugger pause naturally
-	log.Printf("Starting script execution without priming pause channel")
-
-	log.Printf(">>> Script execution starting...")
-	result, err := da.vm.RunScript(da.program, da.sourceCode)
-	log.Printf(">>> Script execution completed. Error: %v", err)
+	log.Printf("Starting script execution...")
+	_, err := da.vm.RunScript(da.program, da.sourceCode)
 	
 	da.running = false
 	
 	if err != nil {
-		log.Printf(">>> Script error: %v", err)
+		log.Printf("Script error: %v", err)
 		da.sendEvent("output", map[string]interface{}{
 			"category": "stderr",
 			"output":   fmt.Sprintf("Error: %v\n", err),
 		})
-	} else if result != nil {
-		log.Printf(">>> Script result: %v", result)
 	}
 	
 	// Send exit event
@@ -830,7 +1056,6 @@ func (da *DebugAdapter) startExecution() {
 		exitCode = 1
 	}
 	
-	log.Printf(">>> Sending exit events (code=%d)", exitCode)
 	da.sendEvent("exited", ExitedEventBody{
 		ExitCode: exitCode,
 	})

@@ -110,15 +110,23 @@ func runGojs() {
 
 		// Set up console.log
 		console := vm.NewObject()
-		console.Set("log", func(args ...interface{}) {
+		console.Set("log", func(call goja.FunctionCall) goja.Value {
 			fmt.Print("console.log: ")
-			for i, arg := range args {
+			for i, arg := range call.Arguments {
 				if i > 0 {
 					fmt.Print(" ")
 				}
-				fmt.Print(arg)
+				// Convert goja.Value to string
+				if arg != nil && !goja.IsUndefined(arg) && !goja.IsNull(arg) {
+					fmt.Print(arg.String())
+				} else if goja.IsNull(arg) {
+					fmt.Print("null")
+				} else {
+					fmt.Print("undefined")
+				}
 			}
 			fmt.Println()
+			return goja.Undefined()
 		})
 		vm.Set("console", console)
 

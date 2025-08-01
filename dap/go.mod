@@ -11,4 +11,5 @@ require (
 	golang.org/x/text v0.3.8 // indirect
 )
 
-replace github.com/dop251/goja => github.com/arturoeanton/goja v0.0.0-20250729040025-e2ff0c5841bb
+//replace github.com/dop251/goja => github.com/arturoeanton/goja v0.0.0-20250729040025-e2ff0c5841bb
+replace github.com/dop251/goja => ../../goja/

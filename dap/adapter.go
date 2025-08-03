@@ -466,8 +466,51 @@ func (da *DebugAdapter) handleStackTrace(req *Request) {
 
 	var frames []StackFrame
 
-	// Always provide at least one frame - the current execution position
-	if da.currentState != nil && da.currentState.SourcePos.Line > 0 {
+	// Use debug stack if available
+	if da.currentState != nil && da.currentState.DebugStack != nil && len(da.currentState.DebugStack) > 0 {
+		for i, frame := range da.currentState.DebugStack {
+			funcName := frame.FuncName()
+			if funcName == "" || funcName == "<native>" {
+				if i == len(da.currentState.DebugStack)-1 {
+					funcName = "<main>"
+				} else {
+					funcName = "<anonymous>"
+				}
+			}
+			
+			// Get position from frame - frame.Position() returns file.Position
+			// Try to use SourcePos from the state first for the current frame
+			line := 0
+			column := 0
+			filename := da.program
+			
+			if i == 0 && da.currentState != nil && da.currentState.SourcePos.Line > 0 {
+				// Use current state position for top frame
+				line = da.currentState.SourcePos.Line
+				column = da.currentState.SourcePos.Column
+				filename = da.currentState.SourcePos.Filename
+			} else {
+				// For other frames, try to parse the position
+				// Note: This is a workaround as we don't have direct access to Position fields
+				srcName := frame.SrcName()
+				if srcName != "" && srcName != "<native>" {
+					filename = srcName
+				}
+			}
+			
+			frames = append(frames, StackFrame{
+				ID:     i + 1,
+				Name:   funcName,
+				Line:   line,
+				Column: column,
+				Source: Source{
+					Name: filepath.Base(filename),
+					Path: filename,
+				},
+			})
+		}
+	} else if da.currentState != nil && da.currentState.SourcePos.Line > 0 {
+		// Fallback to current position only
 		frames = append(frames, StackFrame{
 			ID:     1,
 			Name:   "main",
@@ -710,6 +753,40 @@ func (da *DebugAdapter) handleEvaluate(req *Request) {
 
 	da.logger.Printf("Evaluating: '%s' in context: %s", args.Expression, args.Context)
 
+	// Check if we're trying to evaluate while paused
+	if da.isPaused && da.waitingForCmd {
+		// Try to evaluate by accessing variables directly instead of running code
+		if val := da.trySimpleEvaluation(args.Expression); val != nil {
+			value := da.formatValue(val)
+			valueType := da.getValueType(val)
+			varRef := 0
+
+			// Create reference for complex types
+			if obj, ok := val.(*goja.Object); ok {
+				if _, isFunc := goja.AssertFunction(obj); !isFunc {
+					da.varRefCounter++
+					varRef = da.varRefCounter
+					da.varRefMap[varRef] = val
+				}
+			}
+
+			da.sendResponse(req.Seq, req.Command, true, EvaluateResponseBody{
+				Result:             value,
+				Type:               valueType,
+				VariablesReference: varRef,
+			})
+			return
+		}
+		
+		// For complex expressions, return an error instead of deadlocking
+		da.logger.Printf("Cannot evaluate complex expression while paused: %s", args.Expression)
+		da.sendResponse(req.Seq, req.Command, false, map[string]string{
+			"error": "Cannot evaluate complex expressions while paused. Try simple variable names only.",
+		})
+		return
+	}
+
+	// If not paused, evaluate normally
 	result, err := da.runtime.RunString(args.Expression)
 	if err != nil {
 		da.logger.Printf("Evaluation error: %v", err)
@@ -737,6 +814,48 @@ func (da *DebugAdapter) handleEvaluate(req *Request) {
 		Type:               valueType,
 		VariablesReference: varRef,
 	})
+}
+
+// trySimpleEvaluation attempts to evaluate simple variable names without running code
+func (da *DebugAdapter) trySimpleEvaluation(expr string) goja.Value {
+	// Trim whitespace
+	expr = strings.TrimSpace(expr)
+	
+	// Only handle simple identifiers for now
+	if !isSimpleIdentifier(expr) {
+		return nil
+	}
+	
+	// Try to get from global object
+	globalObj := da.runtime.GlobalObject()
+	if globalObj != nil {
+		if val := globalObj.Get(expr); val != nil && !goja.IsUndefined(val) {
+			return val
+		}
+	}
+	
+	return nil
+}
+
+// isSimpleIdentifier checks if a string is a simple JavaScript identifier
+func isSimpleIdentifier(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	
+	// Check first character
+	if !((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z') || s[0] == '_' || s[0] == '$') {
+		return false
+	}
+	
+	// Check remaining characters
+	for i := 1; i < len(s); i++ {
+		if !((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= '0' && s[i] <= '9') || s[i] == '_' || s[i] == '$') {
+			return false
+		}
+	}
+	
+	return true
 }
 
 func (da *DebugAdapter) handleContinue(req *Request) {
@@ -830,6 +949,11 @@ func (da *DebugAdapter) debugHandler(state *goja.DebuggerState) goja.DebugComman
 	da.logger.Printf("DebugHandler: Called - PC=%d, Line=%d, File=%s, StepMode=%v, InNative=%v, NativeName=%s",
 		state.PC, state.SourcePos.Line, state.SourcePos.Filename, state.StepMode, state.InNativeCall, state.NativeFunctionName)
 	
+	// Log stack information for debugging
+	if state.DebugStack != nil && len(state.DebugStack) > 0 {
+		da.logger.Printf("DebugHandler: Stack depth=%d, top frame: %s", len(state.DebugStack), state.DebugStack[0].FuncName)
+	}
+	
 	if state.Breakpoint != nil {
 		da.logger.Printf("DebugHandler: Hit breakpoint ID=%d at line %d", state.Breakpoint.ID(), state.Breakpoint.SourcePos.Line)
 	}
@@ -852,6 +976,12 @@ func (da *DebugAdapter) debugHandler(state *goja.DebuggerState) goja.DebugComman
 		da.logger.Printf("DebugHandler: In internal code, continuing with step mode")
 		time.Sleep(50 * time.Millisecond) // Brief pause like the console example
 		return goja.DebugStepInto
+	}
+	
+	// Skip stopping in native calls when not stepping
+	if !state.StepMode && state.InNativeCall {
+		da.logger.Printf("DebugHandler: In native call, continuing")
+		return goja.DebugContinue
 	}
 
 	// Send stopped event

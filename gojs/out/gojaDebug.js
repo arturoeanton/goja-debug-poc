@@ -25,8 +25,6 @@ var __importStar = (this && this.__importStar) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.GojaDebugSession = void 0;
 const vscode_debugadapter_1 = require("vscode-debugadapter");
-const path = __importStar(require("path"));
-const child_process_1 = require("child_process");
 const Net = __importStar(require("net"));
 class GojaDebugSession extends vscode_debugadapter_1.LoggingDebugSession {
     constructor() {
@@ -34,6 +32,10 @@ class GojaDebugSession extends vscode_debugadapter_1.LoggingDebugSession {
         this._variableHandles = new vscode_debugadapter_1.Handles();
         this._configurationDone = new Subject();
         this._debugServerPort = 0;
+        this._messageBuffer = '';
+        this._seq = 1;
+        this._dapPendingRequests = new Map();
+        this._isAttach = false;
         this.setDebuggerLinesStartAt1(true);
         this.setDebuggerColumnsStartAt1(true);
     }
@@ -53,37 +55,50 @@ class GojaDebugSession extends vscode_debugadapter_1.LoggingDebugSession {
     }
     configurationDoneRequest(response, args) {
         super.configurationDoneRequest(response, args);
-        this._configurationDone.notify();
+        // Send configurationDone to DAP server
+        this.sendDAPRequest('configurationDone', {}, (dapResponse) => {
+            this._configurationDone.notify();
+        });
+        this.sendResponse(response);
     }
     async launchRequest(response, args) {
-        await this._configurationDone.wait(1000);
-        const program = args.program;
+        this._isAttach = false;
+        this._program = args.program;
         const stopOnEntry = args.stopOnEntry || false;
         this._debugServerPort = args.debugServer || 5678;
-        // Start gojs with debug flag
-        const gojsPath = path.join(__dirname, '../../dap/gojs');
-        const gojsArgs = ['-d', '-port', this._debugServerPort.toString(), '-f', program];
-        this._gojaProcess = (0, child_process_1.spawn)('go', ['run', gojsPath + '.go', ...gojsArgs], {
-            cwd: path.dirname(program)
-        });
-        this._gojaProcess.stdout?.on('data', (data) => {
-            this.sendEvent(new vscode_debugadapter_1.OutputEvent(data.toString(), 'stdout'));
-        });
-        this._gojaProcess.stderr?.on('data', (data) => {
-            this.sendEvent(new vscode_debugadapter_1.OutputEvent(data.toString(), 'stderr'));
-        });
-        this._gojaProcess.on('exit', (code) => {
-            this.sendEvent(new vscode_debugadapter_1.TerminatedEvent());
-        });
-        // Give the debug server time to start
-        await new Promise(resolve => setTimeout(resolve, 1000));
         // Connect to debug server
         await this.connectToDebugServer();
+        // Send initialize to DAP server
+        await this.sendDAPRequestAsync('initialize', {
+            clientID: 'vscode',
+            clientName: 'Visual Studio Code',
+            adapterID: 'goja',
+            pathFormat: 'path',
+            linesStartAt1: true,
+            columnsStartAt1: true
+        });
+        // Send launch to DAP server
+        await this.sendDAPRequestAsync('launch', {
+            request: 'launch',
+            program: this._program,
+            stopOnEntry: stopOnEntry
+        });
+        await this._configurationDone.wait(1000);
         this.sendResponse(response);
     }
     async attachRequest(response, args) {
+        this._isAttach = true;
         this._debugServerPort = args.debugServer || 5678;
         await this.connectToDebugServer();
+        // Send initialize to DAP server
+        await this.sendDAPRequestAsync('initialize', {
+            clientID: 'vscode',
+            clientName: 'Visual Studio Code',
+            adapterID: 'goja',
+            pathFormat: 'path',
+            linesStartAt1: true,
+            columnsStartAt1: true
+        });
         this.sendResponse(response);
     }
     async connectToDebugServer() {
@@ -98,89 +113,245 @@ class GojaDebugSession extends vscode_debugadapter_1.LoggingDebugSession {
             this._debugServerClient.on('close', () => {
                 this.sendEvent(new vscode_debugadapter_1.TerminatedEvent());
             });
+            this._debugServerClient.on('data', (data) => {
+                this.handleDAPData(data);
+            });
         });
     }
-    setBreakPointsRequest(response, args) {
-        const path = args.source.path;
-        const clientLines = args.lines || [];
-        const breakpoints = clientLines.map(l => {
-            const bp = {
-                verified: true,
-                line: l,
-                source: args.source
-            };
-            return bp;
+    handleDAPData(data) {
+        this._messageBuffer += data.toString();
+        while (true) {
+            const headerEnd = this._messageBuffer.indexOf('\r\n\r\n');
+            if (headerEnd === -1) {
+                break;
+            }
+            const header = this._messageBuffer.substring(0, headerEnd);
+            const contentLengthMatch = header.match(/Content-Length: (\d+)/);
+            if (!contentLengthMatch) {
+                this._messageBuffer = this._messageBuffer.substring(headerEnd + 4);
+                continue;
+            }
+            const contentLength = parseInt(contentLengthMatch[1], 10);
+            const messageStart = headerEnd + 4;
+            if (this._messageBuffer.length < messageStart + contentLength) {
+                break;
+            }
+            const message = this._messageBuffer.substring(messageStart, messageStart + contentLength);
+            this._messageBuffer = this._messageBuffer.substring(messageStart + contentLength);
+            try {
+                const dapMessage = JSON.parse(message);
+                this.handleDAPMessage(dapMessage);
+            }
+            catch (e) {
+                console.error('Failed to parse DAP message:', e);
+            }
+        }
+    }
+    handleDAPMessage(message) {
+        if (message.type === 'response') {
+            const handler = this._dapPendingRequests.get(message.request_seq);
+            if (handler) {
+                this._dapPendingRequests.delete(message.request_seq);
+                handler(message);
+            }
+        }
+        else if (message.type === 'event') {
+            switch (message.event) {
+                case 'stopped':
+                    const stoppedBody = message.body;
+                    this.sendEvent(new vscode_debugadapter_1.StoppedEvent(stoppedBody.reason || 'breakpoint', stoppedBody.threadId || GojaDebugSession.threadID));
+                    break;
+                case 'output':
+                    const outputBody = message.body;
+                    this.sendEvent(new vscode_debugadapter_1.OutputEvent(outputBody.output, outputBody.category));
+                    break;
+                case 'terminated':
+                    this.sendEvent(new vscode_debugadapter_1.TerminatedEvent());
+                    break;
+            }
+        }
+    }
+    sendDAPRequest(command, args, handler) {
+        const request = {
+            seq: this._seq++,
+            type: 'request',
+            command: command,
+            arguments: args
+        };
+        if (handler) {
+            this._dapPendingRequests.set(request.seq, handler);
+        }
+        const json = JSON.stringify(request);
+        const message = `Content-Length: ${Buffer.byteLength(json)}\r\n\r\n${json}`;
+        this._debugServerClient?.write(message);
+    }
+    sendDAPRequestAsync(command, args) {
+        return new Promise((resolve) => {
+            this.sendDAPRequest(command, args, resolve);
         });
+    }
+    async setBreakPointsRequest(response, args) {
+        const path = args.source.path;
+        const clientBreakpoints = args.breakpoints || [];
+        const clientLines = args.lines || [];
+        // Send to DAP server
+        const dapResponse = await this.sendDAPRequestAsync('setBreakpoints', {
+            source: { path: path },
+            breakpoints: clientBreakpoints.length > 0
+                ? clientBreakpoints
+                : clientLines.map(line => ({ line }))
+        });
+        const breakpoints = [];
+        if (dapResponse.body?.breakpoints) {
+            dapResponse.body.breakpoints.forEach((bp) => {
+                breakpoints.push({
+                    verified: bp.verified,
+                    line: bp.line,
+                    source: args.source
+                });
+            });
+        }
         response.body = {
             breakpoints: breakpoints
         };
         this.sendResponse(response);
     }
     threadsRequest(response) {
-        response.body = {
-            threads: [
-                new vscode_debugadapter_1.Thread(GojaDebugSession.threadID, "main")
-            ]
-        };
-        this.sendResponse(response);
+        this.sendDAPRequest('threads', {}, (dapResponse) => {
+            if (dapResponse.body?.threads) {
+                response.body = {
+                    threads: dapResponse.body.threads
+                };
+            }
+            else {
+                response.body = {
+                    threads: [new vscode_debugadapter_1.Thread(GojaDebugSession.threadID, "main")]
+                };
+            }
+            this.sendResponse(response);
+        });
     }
     stackTraceRequest(response, args) {
-        const startFrame = typeof args.startFrame === 'number' ? args.startFrame : 0;
-        const maxLevels = typeof args.levels === 'number' ? args.levels : 1000;
-        const frames = [];
-        // This would be populated from the debug adapter
-        response.body = {
-            stackFrames: frames,
-            totalFrames: frames.length
-        };
-        this.sendResponse(response);
+        this.sendDAPRequest('stackTrace', {
+            threadId: args.threadId,
+            startFrame: args.startFrame,
+            levels: args.levels
+        }, (dapResponse) => {
+            if (dapResponse.body) {
+                response.body = dapResponse.body;
+            }
+            else {
+                response.body = {
+                    stackFrames: [],
+                    totalFrames: 0
+                };
+            }
+            this.sendResponse(response);
+        });
     }
     scopesRequest(response, args) {
-        const scopes = [];
-        scopes.push(new vscode_debugadapter_1.Scope("Local", this._variableHandles.create("local"), false));
-        response.body = {
-            scopes: scopes
-        };
-        this.sendResponse(response);
+        this.sendDAPRequest('scopes', {
+            frameId: args.frameId
+        }, (dapResponse) => {
+            if (dapResponse.body?.scopes) {
+                response.body = {
+                    scopes: dapResponse.body.scopes
+                };
+            }
+            else {
+                response.body = {
+                    scopes: []
+                };
+            }
+            this.sendResponse(response);
+        });
     }
     variablesRequest(response, args) {
-        const variables = [];
-        // This would be populated from the debug adapter
-        response.body = {
-            variables: variables
-        };
-        this.sendResponse(response);
+        this.sendDAPRequest('variables', {
+            variablesReference: args.variablesReference,
+            filter: args.filter,
+            start: args.start,
+            count: args.count
+        }, (dapResponse) => {
+            if (dapResponse.body?.variables) {
+                response.body = {
+                    variables: dapResponse.body.variables
+                };
+            }
+            else {
+                response.body = {
+                    variables: []
+                };
+            }
+            this.sendResponse(response);
+        });
     }
     continueRequest(response, args) {
-        this.sendResponse(response);
+        this.sendDAPRequest('continue', {
+            threadId: args.threadId
+        }, () => {
+            this.sendResponse(response);
+        });
     }
     nextRequest(response, args) {
-        this.sendResponse(response);
+        this.sendDAPRequest('next', {
+            threadId: args.threadId
+        }, () => {
+            this.sendResponse(response);
+        });
     }
     stepInRequest(response, args) {
-        this.sendResponse(response);
+        this.sendDAPRequest('stepIn', {
+            threadId: args.threadId
+        }, () => {
+            this.sendResponse(response);
+        });
     }
     stepOutRequest(response, args) {
-        this.sendResponse(response);
+        this.sendDAPRequest('stepOut', {
+            threadId: args.threadId
+        }, () => {
+            this.sendResponse(response);
+        });
     }
     evaluateRequest(response, args) {
-        response.body = {
-            result: 'Not implemented',
-            variablesReference: 0
-        };
-        this.sendResponse(response);
+        this.sendDAPRequest('evaluate', {
+            expression: args.expression,
+            frameId: args.frameId,
+            context: args.context
+        }, (dapResponse) => {
+            if (dapResponse.body) {
+                response.body = dapResponse.body;
+            }
+            else {
+                response.body = {
+                    result: 'Error',
+                    variablesReference: 0
+                };
+            }
+            this.sendResponse(response);
+        });
     }
     pauseRequest(response, args) {
-        this.sendResponse(response);
+        this.sendDAPRequest('pause', {
+            threadId: args.threadId
+        }, () => {
+            this.sendResponse(response);
+        });
     }
     disconnectRequest(response, args) {
-        if (this._debugServerClient) {
-            this._debugServerClient.destroy();
-        }
-        if (this._gojaProcess) {
-            this._gojaProcess.kill();
-        }
-        this.sendResponse(response);
+        this.sendDAPRequest('disconnect', {
+            restart: args.restart,
+            terminateDebuggee: args.terminateDebuggee
+        }, () => {
+            if (this._debugServerClient) {
+                this._debugServerClient.destroy();
+            }
+            if (this._gojaProcess) {
+                this._gojaProcess.kill();
+            }
+            this.sendResponse(response);
+        });
     }
 }
 exports.GojaDebugSession = GojaDebugSession;

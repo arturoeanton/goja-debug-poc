@@ -1,17 +1,18 @@
-var x = 5;
-var y = 10;
-var sum = x + y;
-printMessage("Sum of", x, "and", y, "is:", sum);
+// Simple test script for Goja debugging
+console.log("Hello from Goja!");
 
-if (sum > 10) {
-    printMessage("The sum is greater than 10.");
-} else {
-    printMessage("The sum is 10 or less.");
+let x = 10;
+let y = 20;
+let sum = x + y;
+
+console.log("The sum of", x, "and", y, "is:", sum);
+
+// Test function
+function greet(name) {
+    return "Hello, " + name + "!";
 }
 
-printMessage("End of script.");
+let message = greet("World");
+console.log(message);
 
-
-function printMessage(message) {
-    console.log(message);
-}
+console.log("Script completed");

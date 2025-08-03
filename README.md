@@ -2,8 +2,6 @@
 
 This is a Proof of Concept (POC) for debugging JavaScript code running in the [Goja](https://github.com/dop251/goja) JavaScript runtime using the Debug Adapter Protocol (DAP) and Visual Studio Code.
 
-> ⚠️ **Note**: This is a POC and is not intended to be 100% functional. It demonstrates the core concept of debugging Goja scripts in VS Code.
-
 ## Overview
 
 This project consists of two main components:
@@ -82,7 +80,7 @@ Create a `.vscode/launch.json` file in your project root:
 
 ```bash
 cd dap
-./gojs test.js
+./gojs script.js
 ```
 
 ### Debugging Scripts
@@ -90,7 +88,7 @@ cd dap
 #### Method 1: Attach Mode
 1. Start the script in debug mode:
    ```bash
-   ./gojs -d -f test.js
+   ./gojs -d script.js
    ```
 2. Open VS Code in the project folder
 3. Set breakpoints in your JavaScript file
@@ -104,27 +102,49 @@ cd dap
 ### Custom Debug Port
 
 ```bash
-./gojs -d -port 9000 -f test.js
+./gojs -d -port 9000 script.js
 ```
 
 Remember to update the `debugServer` port in your launch configuration accordingly.
 
-## Demo Screenshots
+## Example
 
-### Debugging Session in VS Code
-![Screenshot 1](screenshot1.png)
+Create a file `example.js`:
 
-### Breakpoint and Variable Inspection
-![Screenshot 2](screenshot2.png)
+```javascript
+console.log("Starting debug example");
+
+function factorial(n) {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+
+let result = factorial(5);
+console.log("Factorial of 5 is:", result);
+
+// Test variables
+let obj = { name: "test", value: 42 };
+let arr = [1, 2, 3, 4, 5];
+
+console.log("Object:", obj);
+console.log("Array:", arr);
+```
+
+Debug it:
+```bash
+./gojs -d example.js
+```
 
 ## Features
 
 - ✅ **Breakpoints**: Set breakpoints in JavaScript code
 - ✅ **Stepping**: Step into, over, and out of functions
 - ✅ **Call Stack**: View the current execution stack
-- ⚠️ **Variables**: Basic variable inspection (simplified implementation)
+- ✅ **Variables**: Basic variable inspection (local and global)
 - ✅ **Console Output**: View console.log output in VS Code
-- ⚠️ **Expression Evaluation**: Limited support for evaluating expressions
+- ✅ **Expression Evaluation**: Evaluate expressions in debug console
 
 ## Architecture
 
@@ -136,17 +156,34 @@ The implementation follows the Debug Adapter Protocol specification:
 4. **Events**: The adapter sends stopped/continued/terminated events
 5. **Stack/Variables**: VS Code requests runtime information when paused
 
+## Project Structure
+
+```
+├── dap/                    # DAP Server implementation
+│   ├── adapter.go          # Main DAP adapter logic
+│   ├── protocol.go         # DAP protocol messages
+│   ├── main.go             # Entry point and CLI
+│   ├── gojs.go             # Goja runtime wrapper
+│   ├── build.sh            # Build script
+│   ├── test_simple_debug.js # Example test file
+│   ├── test_dap_simple.py  # DAP test client
+│   └── docs/               # Goja debugger documentation
+├── gojs/                   # VS Code extension
+│   ├── src/
+│   │   ├── extension.ts    # Extension activation
+│   │   └── gojaDebug.ts    # Debug adapter implementation
+│   ├── package.json        # Extension manifest
+│   └── README.md           # Extension documentation
+└── script.js               # Sample JavaScript file
+```
+
 ## Known Limitations
 
-This is a POC with several limitations:
-
-- Variable inspection is simplified and may not show all object properties
+- Variable inspection shows basic information only
 - No support for conditional breakpoints
 - Single-threaded execution only
+- Limited object property expansion
 - No hot reload support
-- Limited expression evaluation in debug console
-- Error handling is basic
-- Performance is not optimized
 
 ## Technical Details
 
@@ -157,22 +194,6 @@ This POC uses a fork of Goja with debugging capabilities:
 - Adds debugger hooks and breakpoint support
 - Provides stepping and execution control APIs
 
-### File Structure
-
-```
-├── dap/                    # DAP Server implementation
-│   ├── adapter.go         # Main DAP adapter logic
-│   ├── protocol.go        # DAP protocol messages
-│   ├── main.go           # Entry point and CLI
-│   └── gojs.go           # Goja runtime wrapper
-├── gojs/                  # VS Code extension
-│   ├── src/
-│   │   ├── extension.ts   # Extension activation
-│   │   └── gojaDebug.ts   # Debug adapter implementation
-│   └── package.json       # Extension manifest
-└── test*.js              # Sample JavaScript files for testing
-```
-
 ## Troubleshooting
 
 ### Common Issues
@@ -182,23 +203,10 @@ This POC uses a fork of Goja with debugging capabilities:
 3. **No breakpoints hit**: Verify file paths match between debugger and runtime
 4. **Extension not found**: Make sure the `.vsix` file is properly installed
 
-### Debug Output
+### Debug Logs
 
-Enable debug output by setting environment variables:
-```bash
-DEBUG=1 ./gojs -d -f test.js
-```
-
-## Contributing
-
-This is a POC project. Feel free to experiment and improve upon it:
-
-1. Enhanced variable inspection
-2. Better error handling
-3. Conditional breakpoints
-4. Watch expressions
-5. Multi-file debugging support
+The DAP adapter creates a log file `dap-adapter.log` for troubleshooting.
 
 ## License
 
-This project is provided as-is for demonstration purposes. See the individual component licenses for specific terms.
+MIT

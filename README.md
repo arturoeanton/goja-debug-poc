@@ -1,6 +1,10 @@
 # Goja Debug POC
 
+⚠️ **PROOF OF CONCEPT - EXPERIMENTAL** ⚠️
+
 This is a Proof of Concept (POC) for debugging JavaScript code running in the [Goja](https://github.com/dop251/goja) JavaScript runtime using the Debug Adapter Protocol (DAP) and Visual Studio Code.
+
+**Important Note**: This implementation has known limitations and is intended for demonstration purposes. For production debugging needs, consider using the more stable console debugger available in the [Goja fork](https://github.com/arturoeanton/goja), which provides better functionality with fewer issues.
 
 ## Overview
 
@@ -179,11 +183,30 @@ The implementation follows the Debug Adapter Protocol specification:
 
 ## Known Limitations
 
+⚠️ **This POC has several known issues that affect debugging reliability:**
+
+### Critical Issues
+- **Function Stepping**: Step-into functionality with function calls may not work consistently
+- **Stack Synchronization**: VS Code pointer position may become desynchronized with actual execution
+- **Expression Evaluation**: Limited expression evaluation while paused (simple variables only)
+- **Call Stack Display**: Stack trace information may be incomplete or inaccurate
+
+### General Limitations
 - Variable inspection shows basic information only
 - No support for conditional breakpoints
 - Single-threaded execution only
 - Limited object property expansion
 - No hot reload support
+- Debugging complex closures and async operations is not supported
+
+### Recommended Alternative
+
+For more reliable debugging experience, we recommend using the **console debugger** from the Goja fork:
+- Repository: [https://github.com/arturoeanton/goja](https://github.com/arturoeanton/goja)
+- Location: `cmd/goja-debug-console/`
+- Features: More stable function stepping, better variable inspection, fewer synchronization issues
+
+The console debugger provides a terminal-based debugging interface that's more mature and reliable than this VS Code integration.
 
 ## Technical Details
 
@@ -206,6 +229,32 @@ This POC uses a fork of Goja with debugging capabilities:
 ### Debug Logs
 
 The DAP adapter creates a log file `dap-adapter.log` for troubleshooting.
+
+## Contributing
+
+🤝 **Contributions Welcome!**
+
+This project is a proof of concept with known limitations. If you're interested in improving the VS Code debugging experience for Goja, contributions are welcome!
+
+### How to Contribute
+
+1. **Fork the repository**
+2. **Create a feature branch** for your improvements
+3. **Test your changes** thoroughly with the provided test scripts
+4. **Submit a pull request** with a clear description of the improvements
+
+### Areas for Improvement
+
+- Fix function stepping synchronization issues
+- Improve stack trace accuracy
+- Enhance expression evaluation capabilities
+- Add support for conditional breakpoints
+- Better error handling and recovery
+- Performance optimizations
+
+### Development Setup
+
+See the setup instructions above to get the development environment running. The `dap/` directory contains test scripts that can help validate improvements.
 
 ## License
 

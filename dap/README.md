@@ -1,61 +1,86 @@
-# Goja DAP (Debug Adapter Protocol) Implementation
+# Goja Debug Adapter Protocol (DAP) Server
 
-This directory contains a Debug Adapter Protocol implementation for the Goja JavaScript runtime, allowing you to debug Goja scripts in VS Code and other DAP-compatible editors.
+Un servidor DAP completo para debugging de scripts JavaScript en el motor Goja, compatible con VS Code.
 
-## Components
+## Características
 
-1. **DAP Server** (`adapter.go`, `protocol.go`, `main.go`) - Implements the Debug Adapter Protocol
-2. **gojs CLI** (`gojs.go`) - Command-line tool to run Goja scripts with debugging support
-3. **VS Code Extension** (`/gojs/`) - Extension for debugging in Visual Studio Code
+✅ **Breakpoints**: Soporte completo para breakpoints en líneas específicas  
+✅ **Step Operations**: Step Into, Step Over, Step Out  
+✅ **Variable Inspection**: Variables globales y locales  
+✅ **Call Stack**: Stack completo con información de contexto  
+✅ **REPL/Debug Console**: Evaluación de expresiones en tiempo real  
+✅ **Native Function Handling**: Manejo inteligente de funciones nativas  
+✅ **Flow Control**: Seguimiento del flujo de código sin paradas innecesarias  
 
-## Building
+## Construcción
 
 ```bash
-go build -o gojs .
+./build.sh
 ```
 
-This creates a single binary that can act as both the gojs CLI and the DAP server.
+## Uso
 
-## Usage
-
-### Running Scripts Normally
-
+### Modo Normal
 ```bash
 ./gojs script.js
-# or
-./gojs -f script.js
 ```
 
-### Running Scripts in Debug Mode
-
+### Modo Debug
 ```bash
-./gojs -d -f script.js
+./gojs -d script.js              # Puerto por defecto 5678
+./gojs -d -port 9000 script.js   # Puerto personalizado
 ```
 
-This will:
-1. Start a DAP server on port 5678 (default)
-2. Wait for a debugger to connect
-3. Display connection instructions for VS Code
+## Configuración para VS Code
 
-### Custom Debug Port
+### 1. Crear extensión Goja (opcional)
 
-```bash
-./gojs -d -port 9000 -f script.js
+Crea un archivo `package.json` para una extensión VS Code simple:
+
+```json
+{
+    "name": "goja-debug",
+    "displayName": "Goja Debug",
+    "version": "0.1.0",
+    "engines": {
+        "vscode": "^1.50.0"
+    },
+    "categories": ["Debuggers"],
+    "contributes": {
+        "debuggers": [{
+            "type": "goja",
+            "label": "Goja Debug",
+            "program": "./gojs",
+            "configurationAttributes": {
+                "launch": {
+                    "required": ["program"],
+                    "properties": {
+                        "program": {
+                            "type": "string",
+                            "description": "Absolute path to the JavaScript file.",
+                            "default": "${workspaceFolder}/main.js"
+                        },
+                        "debugServer": {
+                            "type": "number",
+                            "description": "Port for the debug adapter server.",
+                            "default": 5678
+                        },
+                        "stopOnEntry": {
+                            "type": "boolean",
+                            "description": "Automatically stop after launch.",
+                            "default": false
+                        }
+                    }
+                }
+            }
+        }]
+    }
+}
 ```
 
-## VS Code Integration
+### 2. Configuración launch.json
 
-### Installing the Extension
-
-1. Navigate to the `gojs/` directory
-2. Run `npm install`
-3. Run `npm run compile`
-4. Package the extension: `vsce package`
-5. Install the generated `.vsix` file in VS Code
-
-### Creating a Debug Configuration
-
-Create `.vscode/launch.json` in your project:
+En tu proyecto, crea o actualiza `.vscode/launch.json`:
 
 ```json
 {
@@ -65,52 +90,150 @@ Create `.vscode/launch.json` in your project:
             "type": "goja",
             "request": "launch",
             "name": "Debug Goja Script",
-            "program": "${workspaceFolder}/test.js",
-            "stopOnEntry": false,
-            "debugServer": 5678
+            "program": "${workspaceFolder}/test-debug.js",
+            "debugServer": 5678,
+            "stopOnEntry": false
         }
     ]
 }
 ```
 
-### Debugging Workflow
+### 3. Debugging
 
-1. Start your script with `gojs -d -f test.js`
-2. Open the folder in VS Code
-3. Set breakpoints in your JavaScript file
-4. Press F5 to start debugging
+1. **Iniciar el servidor DAP:**
+   ```bash
+   ./gojs -d test-debug.js
+   ```
 
-## Features
+2. **En VS Code:**
+   - Abrir el archivo JavaScript que quieres debuggear
+   - Poner breakpoints haciendo clic en el margen izquierdo
+   - Presionar `F5` o usar "Run and Debug"
+   - Seleccionar "Debug Goja Script"
 
-- **Breakpoints**: Set breakpoints in your JavaScript code
-- **Stepping**: Step into, over, and out of functions
-- **Call Stack**: View the current call stack
-- **Variables**: Inspect local variables (basic implementation)
-- **Console Output**: View console.log output in VS Code
+3. **Funcionalidades disponibles:**
+   - **Breakpoints**: Clic en margen izquierdo para agregar/quitar
+   - **Step Into (F11)**: Entrar en funciones
+   - **Step Over (F10)**: Ejecutar línea sin entrar en funciones
+   - **Step Out (Shift+F11)**: Salir de función actual
+   - **Continue (F5)**: Continuar ejecución
+   - **Variables Panel**: Ver variables locales y globales
+   - **Call Stack Panel**: Ver el stack de llamadas
+   - **Debug Console**: Evaluar expresiones (`x + y`, `typeof variable`, etc.)
 
-## Architecture
+## Ejemplos de Uso
 
-The implementation follows the DAP specification:
+### Script de Prueba
+```javascript
+// test-debug.js
+console.log("Starting debug test...");
 
-1. **Launch**: VS Code sends a launch request with the script path
-2. **Breakpoints**: VS Code sends breakpoint locations
-3. **Execution**: The adapter controls the Goja runtime
-4. **Events**: The adapter sends stopped/terminated events
-5. **Stack/Variables**: VS Code requests runtime information
+var globalVar = "I am global";
+var globalNumber = 42;
 
-## Limitations
+function testFunction(param1, param2) {
+    var localVar = "I am local";
+    var localNumber = param1 + param2;
+    
+    debugger; // Pausa automática aquí
+    
+    console.log("localVar:", localVar);
+    console.log("localNumber:", localNumber);
+    
+    return localNumber;
+}
 
-- Variable inspection is simplified (full implementation would require deeper Goja integration)
-- No support for conditional breakpoints yet
-- Single-threaded execution (Goja limitation)
-- No hot reload support
+var result = testFunction(10, 20);
+console.log("Result:", result);
+```
 
-## Example Script
+### Debugging Avanzado
 
-See `test.js` for a sample script demonstrating various JavaScript features that can be debugged.
+1. **Inspección de Variables:**
+   - Variables globales aparecen en el scope "Global"
+   - Variables locales aparecen en el scope "Local"
+   - Objetos complejos se pueden expandir
+
+2. **Debug Console:**
+   ```javascript
+   // Evaluar expresiones en tiempo real
+   localVar + " modified"
+   typeof globalNumber
+   globalObject.nested.inner
+   ```
+
+3. **Breakpoints Condicionales:**
+   - Próximamente (no implementado aún)
+
+## Arquitectura
+
+### Componentes
+
+- **`main.go`**: Punto de entrada principal
+- **`gojs.go`**: CLI para ejecutar scripts
+- **`adapter.go`**: Implementación del protocolo DAP
+- **`protocol.go`**: Definiciones de tipos DAP
+
+### Flujo de Funcionamiento
+
+1. **Inicio**: `./gojs -d script.js` inicia el servidor DAP
+2. **Conexión**: VS Code se conecta via TCP al puerto especificado
+3. **Protocolo**: Comunicación via Debug Adapter Protocol (JSON-RPC sobre TCP)
+4. **Ejecución**: El script se ejecuta con debugger habilitado
+5. **Interacción**: Breakpoints, steps, y evaluaciones según comandos de VS Code
+
+### Manejo de Funciones Nativas
+
+El servidor maneja inteligentemente las funciones nativas de Go:
+- Las funciones nativas se ejecutan sin parar el debugger
+- El flujo se mantiene en código JavaScript relevante
+- Se evitan paradas innecesarias en código interno
 
 ## Troubleshooting
 
-1. **Port already in use**: Use a different port with `-port` flag
-2. **Can't connect**: Ensure the DAP server is running before starting VS Code debugger
-3. **No breakpoints hit**: Verify the file paths match between the debugger and runtime
+### Error: "Port already in use"
+```bash
+# Cambiar puerto
+./gojs -d -port 9000 script.js
+```
+
+### Error: "No debugger connection"
+- Verificar que VS Code esté configurado con el puerto correcto
+- Comprobar que no haya firewall bloqueando la conexión
+- Reiniciar el servidor DAP
+
+### Variables no aparecen
+- Verificar que estés pausado en un breakpoint o step
+- Las variables locales solo aparecen dentro de funciones
+- Usar el Debug Console para evaluación manual
+
+### Breakpoints no funcionan
+- Verificar que el archivo en VS Code sea el mismo que se está ejecutando
+- Los breakpoints solo funcionan en líneas ejecutables
+- Evitar poner breakpoints en líneas vacías o comentarios
+
+## Desarrollo
+
+### Estructura del Proyecto
+```
+dap/
+├── adapter.go          # Implementación DAP principal
+├── protocol.go         # Tipos y estructuras DAP
+├── main.go            # Punto de entrada
+├── gojs.go            # CLI runner
+├── build.sh           # Script de construcción
+├── test-debug.js      # Script de prueba
+└── README.md          # Esta documentación
+```
+
+### Extending
+
+Para agregar nuevas funcionalidades:
+
+1. **Nuevos comandos DAP**: Actualizar `protocol.go` y `adapter.go`
+2. **Mejores variables**: Modificar `getLocalVariables()` y `getGlobalVariables()`
+3. **Breakpoints condicionales**: Extender `handleSetBreakpoints()`
+
+---
+
+¡El servidor DAP está listo para usar! Disfruta debugging tus scripts JavaScript con Goja en VS Code. 🚀

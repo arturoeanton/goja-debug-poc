@@ -38,7 +38,8 @@ func runGojs() {
 	}
 
 	if debugMode {
-		fmt.Printf("Starting in debug mode on port %d...\n", debugPort)
+		fmt.Printf("Starting Goja Debug Server on port %d...\n", debugPort)
+		fmt.Printf("File to debug: %s\n", fileName)
 		fmt.Println("Waiting for debugger to connect...")
 
 		// Get absolute path
@@ -48,22 +49,17 @@ func runGojs() {
 			os.Exit(1)
 		}
 
-		// Start the debug adapter in a goroutine
-		go func() {
-			// Create and run the debug adapter
-			listener, err := net.Listen("tcp", fmt.Sprintf(":%d", debugPort))
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to listen on port %d: %v\n", debugPort, err)
-				os.Exit(1)
-			}
-			defer listener.Close()
+		// Start the debug adapter server
+		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", debugPort))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to listen on port %d: %v\n", debugPort, err)
+			os.Exit(1)
+		}
+		defer listener.Close()
 
-			fmt.Printf("\nDebug adapter listening on port %d\n", debugPort)
-			fmt.Printf("To debug in VS Code:\n")
-			fmt.Printf("1. Open VS Code\n")
-			fmt.Printf("2. Open the folder containing '%s'\n", fileName)
-			fmt.Printf("3. Create or update .vscode/launch.json with:\n")
-			fmt.Printf(`{
+		fmt.Printf("\nDebug server ready on port %d\n", debugPort)
+		fmt.Printf("VS Code launch.json configuration:\n")
+		fmt.Printf(`{
     "version": "0.2.0",
     "configurations": [
         {
@@ -76,25 +72,21 @@ func runGojs() {
     ]
 }
 `, absPath, debugPort)
-			fmt.Printf("\n4. Press F5 to start debugging\n")
-			fmt.Printf("\nWaiting for debugger connection...\n")
+		fmt.Printf("\nWaiting for debugger connection...\n")
 
-			// Accept connection
-			conn, err := listener.Accept()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to accept connection: %v\n", err)
-				return
-			}
-			defer conn.Close()
+		// Accept connection
+		conn, err := listener.Accept()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to accept connection: %v\n", err)
+			return
+		}
+		defer conn.Close()
 
-			// Run the debug adapter
-			adapter := NewDebugAdapter(conn, conn)
-			adapter.program = absPath
-			adapter.Run()
-		}()
+		fmt.Println("Debugger connected!")
 
-		// Keep the main process running
-		select {}
+		// Run the debug adapter
+		adapter := NewDebugAdapter(conn, conn)
+		adapter.Run()
 	} else {
 		// Run normally without debugging
 		fmt.Printf("Running %s...\n", fileName)
@@ -110,23 +102,15 @@ func runGojs() {
 
 		// Set up console.log
 		console := vm.NewObject()
-		console.Set("log", func(call goja.FunctionCall) goja.Value {
+		console.Set("log", func(args ...interface{}) {
 			fmt.Print("console.log: ")
-			for i, arg := range call.Arguments {
+			for i, arg := range args {
 				if i > 0 {
 					fmt.Print(" ")
 				}
-				// Convert goja.Value to string
-				if arg != nil && !goja.IsUndefined(arg) && !goja.IsNull(arg) {
-					fmt.Print(arg.String())
-				} else if goja.IsNull(arg) {
-					fmt.Print("null")
-				} else {
-					fmt.Print("undefined")
-				}
+				fmt.Print(arg)
 			}
 			fmt.Println()
-			return goja.Undefined()
 		})
 		vm.Set("console", console)
 

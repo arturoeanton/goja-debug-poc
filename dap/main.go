@@ -23,9 +23,11 @@ func main() {
 	flag.BoolVar(&server, "server", false, "Run in server mode")
 	flag.Parse()
 
+	// Set up logging to stderr so it doesn't interfere with DAP communication
+	log.SetOutput(os.Stderr)
+
 	if port == 0 {
 		// Stdio mode
-		log.SetOutput(os.Stderr)
 		adapter := NewDebugAdapter(os.Stdin, os.Stdout)
 		adapter.Run()
 	} else {

@@ -1,6 +1,6 @@
-module github.com/arturoeanton/goja-debug-poc/dap
+module goja-dap-server
 
-go 1.24.5
+go 1.21
 
 require github.com/dop251/goja v0.0.0-20250630131328-58d95d85e994
 
@@ -11,5 +11,4 @@ require (
 	golang.org/x/text v0.3.8 // indirect
 )
 
-//replace github.com/dop251/goja => github.com/arturoeanton/goja v0.0.0-20250729040025-e2ff0c5841bb
-replace github.com/dop251/goja => ../../goja/
+replace github.com/dop251/goja => ../../goja
